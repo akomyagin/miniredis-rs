@@ -1,0 +1,17 @@
+[package]
+name = "miniredis"
+version = "0.1.0"
+edition = "2021"
+description = "A from-scratch in-memory KV server speaking the Redis RESP wire protocol (TTL + O(1) LRU eviction)"
+license = "MIT"
+
+# Concurrency model decision (see docs/TECHNICAL_PLAN.md, Этап 5):
+# MVP uses the standard library only — thread-per-connection with std::net::TcpListener.
+# No tokio in v1. The whole point of the project is to learn the raw mechanics of
+# streaming TCP parsing and shared-state synchronization, which an async runtime would
+# hide behind its own abstractions. Migrating the protocol layer to tokio is a
+# documented POST_MVP item, not an MVP dependency.
+
+[dependencies]
+
+[dev-dependencies]
