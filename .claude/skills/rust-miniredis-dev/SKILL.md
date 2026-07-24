@@ -76,7 +76,9 @@ RESP идёт по потоковому TCP: один `read()` возвраща�
 
 ## Пайплайн Этапа
 
-Opus 4.8 — план + код → Sonnet 5 (осн. чат) — покрытие/тесты/работоспособность → Opus (Agent,
-`model: opus`) — `/code-review` на diff ветки → до 3 итераций правок → commit+push+PR (русский
+Sonnet 5 (осн. чат) — проверка готовности → Opus 4.8 (Agent, `model: opus`) — план, если этап
+требует детального плана (код не пишет) → Fable 5 (Agent, `model: claude-fable-5`) — код по
+плану → Sonnet 5 (осн. чат) — покрытие/тесты/работоспособность → Opus (Agent, `model: opus`) —
+`/code-review` на diff ветки → до 3 итераций правок → commit+push+PR (русский
 conventional-commit subject, трейлер `Co-Authored-By: Claude`) в `master`. Ветка от `master` на
 Этап. Детали — в `CLAUDE.md`.
