@@ -7,6 +7,7 @@
 use crate::resp::Value;
 use crate::store::Store;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Dispatch one decoded client frame (must be a `Value::Array` of `Value::Bulk`) against
 /// the shared store, returning the RESP reply to write back.
@@ -24,6 +25,8 @@ pub fn dispatch(store: &Arc<Mutex<Store>>, frame: Value) -> Value {
         "SET" => cmd_set(store, &args),
         "GET" => cmd_get(store, &args),
         "DEL" => cmd_del(store, &args),
+        "EXPIRE" => cmd_expire(store, &args),
+        "TTL" => cmd_ttl(store, &args),
         _ => Value::Error(format!("ERR unknown command '{name}'")),
     }
 }
@@ -52,14 +55,84 @@ fn cmd_ping(args: &[Vec<u8>]) -> Value {
 }
 
 fn cmd_set(store: &Arc<Mutex<Store>>, args: &[Vec<u8>]) -> Value {
-    if args.len() != 3 {
+    if args.len() < 3 {
         return Value::Error("ERR wrong number of arguments for 'set' command".into());
     }
     let key = args[1].clone();
     let value = args[2].clone();
-    // TODO(Этап 3): parse EX/PX options into an expires_at instant.
-    store.lock().unwrap().set(key, value, None);
+
+    let expires_at = match parse_set_expiry(&args[3..]) {
+        Ok(exp) => exp,
+        Err(e) => return Value::Error(e),
+    };
+
+    store.lock().unwrap().set(key, value, expires_at);
     Value::Simple("OK".into())
+}
+
+/// Parses the trailing `SET key value [EX seconds | PX milliseconds]` options. MVP
+/// supports at most one of EX/PX and no other options (NX/XX/KEEPTTL are out of scope,
+/// see TECHNICAL_PLAN.md "Открытые решения").
+fn parse_set_expiry(opts: &[Vec<u8>]) -> Result<Option<Instant>, String> {
+    if opts.is_empty() {
+        return Ok(None);
+    }
+    if opts.len() != 2 {
+        return Err("ERR syntax error".into());
+    }
+    let opt_name = String::from_utf8_lossy(&opts[0]).to_ascii_uppercase();
+    let n: i64 = std::str::from_utf8(&opts[1])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| "ERR value is not an integer or out of range".to_string())?;
+    if n <= 0 {
+        // Unlike EXPIRE (where a non-positive value deletes the key), SET rejects a
+        // non-positive EX/PX — deliberate asymmetry matching Redis, see TECHNICAL_PLAN.md.
+        return Err("ERR invalid expire time in 'set' command".into());
+    }
+    let duration = match opt_name.as_str() {
+        "EX" => Duration::from_secs(n as u64),
+        "PX" => Duration::from_millis(n as u64),
+        _ => return Err("ERR syntax error".into()),
+    };
+    // checked_add: an absurdly large but syntactically valid EX/PX (e.g. i64::MAX seconds)
+    // would otherwise panic on Instant's internal overflow check.
+    Instant::now()
+        .checked_add(duration)
+        .map(Some)
+        .ok_or_else(|| "ERR invalid expire time in 'set' command".to_string())
+}
+
+fn cmd_expire(store: &Arc<Mutex<Store>>, args: &[Vec<u8>]) -> Value {
+    if args.len() != 3 {
+        return Value::Error("ERR wrong number of arguments for 'expire' command".into());
+    }
+    let secs: i64 = match std::str::from_utf8(&args[2])
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(n) => n,
+        None => return Value::Error("ERR value is not an integer or out of range".into()),
+    };
+    if secs <= 0 {
+        // Redis semantics: a non-positive expire deletes the key immediately.
+        let existed = store.lock().unwrap().del(&args[1]);
+        return Value::Integer(if existed { 1 } else { 0 });
+    }
+    let at = match Instant::now().checked_add(Duration::from_secs(secs as u64)) {
+        Some(at) => at,
+        // Same overflow guard as SET EX/PX (checked_add over Instant's internal range).
+        None => return Value::Error("ERR invalid expire time in 'expire' command".into()),
+    };
+    let ok = store.lock().unwrap().expire(&args[1], at);
+    Value::Integer(if ok { 1 } else { 0 })
+}
+
+fn cmd_ttl(store: &Arc<Mutex<Store>>, args: &[Vec<u8>]) -> Value {
+    if args.len() != 2 {
+        return Value::Error("ERR wrong number of arguments for 'ttl' command".into());
+    }
+    Value::Integer(store.lock().unwrap().ttl_secs(&args[1]))
 }
 
 fn cmd_get(store: &Arc<Mutex<Store>>, args: &[Vec<u8>]) -> Value {
@@ -279,6 +352,219 @@ mod tests {
         );
     }
 
+    // --- TTL commands (Этап 3) ---
+
+    /// Unwrap an Integer reply or panic with context.
+    fn int_reply(v: Value) -> i64 {
+        match v {
+            Value::Integer(n) => n,
+            other => panic!("expected integer reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_with_ex_gives_ttl_within_bounds() {
+        let store = new_store();
+        assert_eq!(
+            dispatch(&store, frame(&[b"SET", b"foo", b"bar", b"EX", b"10"])),
+            Value::Simple("OK".into())
+        );
+        let ttl = int_reply(dispatch(&store, frame(&[b"TTL", b"foo"])));
+        assert!((1..=10).contains(&ttl), "ttl was {ttl}");
+    }
+
+    #[test]
+    fn set_with_px_gives_ttl_within_bounds() {
+        let store = new_store();
+        assert_eq!(
+            dispatch(&store, frame(&[b"SET", b"foo", b"bar", b"PX", b"5000"])),
+            Value::Simple("OK".into())
+        );
+        let ttl = int_reply(dispatch(&store, frame(&[b"TTL", b"foo"])));
+        assert!((1..=5).contains(&ttl), "ttl was {ttl}");
+    }
+
+    #[test]
+    fn set_expiry_option_name_is_case_insensitive() {
+        let store = new_store();
+        assert_eq!(
+            dispatch(&store, frame(&[b"SET", b"foo", b"bar", b"ex", b"10"])),
+            Value::Simple("OK".into())
+        );
+        let ttl = int_reply(dispatch(&store, frame(&[b"TTL", b"foo"])));
+        assert!((1..=10).contains(&ttl), "ttl was {ttl}");
+    }
+
+    #[test]
+    fn set_with_non_numeric_expiry_is_an_error() {
+        let store = new_store();
+        assert_eq!(
+            dispatch(&store, frame(&[b"SET", b"foo", b"bar", b"EX", b"abc"])),
+            Value::Error("ERR value is not an integer or out of range".into())
+        );
+    }
+
+    #[test]
+    fn set_with_non_positive_expiry_is_an_error() {
+        let store = new_store();
+        assert_eq!(
+            dispatch(&store, frame(&[b"SET", b"foo", b"bar", b"EX", b"0"])),
+            Value::Error("ERR invalid expire time in 'set' command".into())
+        );
+        assert_eq!(
+            dispatch(&store, frame(&[b"SET", b"foo", b"bar", b"PX", b"-5"])),
+            Value::Error("ERR invalid expire time in 'set' command".into())
+        );
+        // The rejected SET must not have stored anything.
+        assert_eq!(dispatch(&store, frame(&[b"GET", b"foo"])), Value::Null);
+    }
+
+    #[test]
+    fn set_with_absurdly_large_ex_does_not_panic() {
+        // i64::MAX seconds overflows Instant's internal range on addition (regression
+        // test — this used to panic the connection-handler thread via unchecked `+`).
+        let store = new_store();
+        assert_eq!(
+            dispatch(
+                &store,
+                frame(&[b"SET", b"foo", b"bar", b"EX", b"9223372036854775807"])
+            ),
+            Value::Error("ERR invalid expire time in 'set' command".into())
+        );
+        assert_eq!(dispatch(&store, frame(&[b"GET", b"foo"])), Value::Null);
+    }
+
+    #[test]
+    fn set_with_max_px_does_not_panic() {
+        // i64::MAX milliseconds is a much smaller Duration than i64::MAX seconds, so it
+        // stays within Instant's range and legitimately succeeds — this just confirms the
+        // checked_add guard doesn't misfire on a value that's merely large, not overflowing.
+        let store = new_store();
+        assert_eq!(
+            dispatch(
+                &store,
+                frame(&[b"SET", b"foo", b"bar", b"PX", b"9223372036854775807"])
+            ),
+            Value::Simple("OK".into())
+        );
+    }
+
+    #[test]
+    fn set_with_unknown_option_is_a_syntax_error() {
+        let store = new_store();
+        assert_eq!(
+            dispatch(&store, frame(&[b"SET", b"foo", b"bar", b"FOO", b"5"])),
+            Value::Error("ERR syntax error".into())
+        );
+    }
+
+    #[test]
+    fn set_with_dangling_expiry_option_is_a_syntax_error() {
+        let store = new_store();
+        assert_eq!(
+            dispatch(&store, frame(&[b"SET", b"foo", b"bar", b"EX"])),
+            Value::Error("ERR syntax error".into())
+        );
+    }
+
+    #[test]
+    fn expire_on_missing_key_returns_zero() {
+        let store = new_store();
+        assert_eq!(
+            dispatch(&store, frame(&[b"EXPIRE", b"absent", b"10"])),
+            Value::Integer(0)
+        );
+    }
+
+    #[test]
+    fn expire_then_ttl_round_trip() {
+        let store = new_store();
+        dispatch(&store, frame(&[b"SET", b"foo", b"bar"]));
+        assert_eq!(
+            dispatch(&store, frame(&[b"EXPIRE", b"foo", b"100"])),
+            Value::Integer(1)
+        );
+        let ttl = int_reply(dispatch(&store, frame(&[b"TTL", b"foo"])));
+        assert!((1..=100).contains(&ttl), "ttl was {ttl}");
+    }
+
+    #[test]
+    fn expire_with_non_positive_seconds_deletes_the_key() {
+        let store = new_store();
+        dispatch(&store, frame(&[b"SET", b"foo", b"bar"]));
+        assert_eq!(
+            dispatch(&store, frame(&[b"EXPIRE", b"foo", b"0"])),
+            Value::Integer(1)
+        );
+        assert_eq!(dispatch(&store, frame(&[b"GET", b"foo"])), Value::Null);
+        // Same for a negative value on a now-missing key: nothing to delete.
+        assert_eq!(
+            dispatch(&store, frame(&[b"EXPIRE", b"foo", b"-5"])),
+            Value::Integer(0)
+        );
+    }
+
+    #[test]
+    fn expire_with_absurdly_large_seconds_does_not_panic() {
+        // Same regression as SET EX/PX: a valid i64 that overflows Instant on addition.
+        let store = new_store();
+        dispatch(&store, frame(&[b"SET", b"foo", b"bar"]));
+        assert_eq!(
+            dispatch(&store, frame(&[b"EXPIRE", b"foo", b"9223372036854775807"])),
+            Value::Error("ERR invalid expire time in 'expire' command".into())
+        );
+    }
+
+    #[test]
+    fn expire_with_non_numeric_seconds_is_an_error() {
+        let store = new_store();
+        dispatch(&store, frame(&[b"SET", b"foo", b"bar"]));
+        assert_eq!(
+            dispatch(&store, frame(&[b"EXPIRE", b"foo", b"abc"])),
+            Value::Error("ERR value is not an integer or out of range".into())
+        );
+    }
+
+    #[test]
+    fn expire_wrong_arity_is_an_error() {
+        let store = new_store();
+        assert!(matches!(
+            dispatch(&store, frame(&[b"EXPIRE", b"foo"])),
+            Value::Error(_)
+        ));
+        assert!(matches!(
+            dispatch(&store, frame(&[b"EXPIRE", b"foo", b"1", b"extra"])),
+            Value::Error(_)
+        ));
+    }
+
+    #[test]
+    fn ttl_of_key_without_expiry_and_of_missing_key() {
+        let store = new_store();
+        dispatch(&store, frame(&[b"SET", b"foo", b"bar"]));
+        assert_eq!(
+            dispatch(&store, frame(&[b"TTL", b"foo"])),
+            Value::Integer(-1)
+        );
+        assert_eq!(
+            dispatch(&store, frame(&[b"TTL", b"absent"])),
+            Value::Integer(-2)
+        );
+    }
+
+    #[test]
+    fn ttl_wrong_arity_is_an_error() {
+        let store = new_store();
+        assert!(matches!(
+            dispatch(&store, frame(&[b"TTL"])),
+            Value::Error(_)
+        ));
+        assert!(matches!(
+            dispatch(&store, frame(&[b"TTL", b"a", b"b"])),
+            Value::Error(_)
+        ));
+    }
+
     // --- Deterministic integration fake: real Parser + dispatch + encode, no sockets. ---
     // Simulates the byte stream a client would send, exactly as main::handle_connection
     // would see it, and checks the encoded reply bytes.
@@ -366,5 +652,35 @@ mod tests {
             }
             assert_eq!(out, expected, "split at byte {split}");
         }
+    }
+
+    // Timing-dependent integration fake: a key set with PX expires through the full RESP
+    // stack after a sleep. Margins are generous (500ms window, 300ms past expiry) so the
+    // test stays stable in CI — see TECHNICAL_PLAN.md, Этап 3.
+    #[test]
+    fn integration_fake_key_expires_after_px_through_full_stack() {
+        let store = new_store();
+        assert_eq!(
+            run_session(
+                &store,
+                &encode_command(&[b"SET", b"foo", b"bar", b"PX", b"500"])
+            ),
+            b"+OK\r\n"
+        );
+        // Still alive well within its 500ms lifetime.
+        assert_eq!(
+            run_session(&store, &encode_command(&[b"GET", b"foo"])),
+            b"$3\r\nbar\r\n"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        // 300ms past expiry: lazily expired on access, nil over the wire.
+        assert_eq!(
+            run_session(&store, &encode_command(&[b"GET", b"foo"])),
+            b"$-1\r\n"
+        );
+        assert_eq!(
+            run_session(&store, &encode_command(&[b"TTL", b"foo"])),
+            b":-2\r\n"
+        );
     }
 }

@@ -17,6 +17,9 @@ use store::Store;
 /// `redis-cli` (which defaults to 6379) connects with no extra flags.
 const DEFAULT_ADDR: &str = "127.0.0.1:6379";
 
+/// How often the background sweeper reaps expired keys (fixed by TECHNICAL_PLAN.md, Этап 3).
+const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 fn main() -> std::io::Result<()> {
     let addr = std::env::args()
         .nth(1)
@@ -26,6 +29,7 @@ fn main() -> std::io::Result<()> {
     println!("miniredis listening on {addr}");
 
     let store = Arc::new(Mutex::new(Store::new()));
+    spawn_sweeper(Arc::clone(&store));
 
     for stream in listener.incoming() {
         let stream = stream?;
@@ -34,6 +38,17 @@ fn main() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Background sweeper: periodically reaps expired keys so they disappear even if never
+/// accessed again (lazy expiration alone would leak them). The thread is detached and
+/// never joined — the process exits via Ctrl-C/signal like every other thread (no
+/// graceful shutdown in v1; see TECHNICAL_PLAN.md, Этап 5).
+fn spawn_sweeper(store: Arc<Mutex<Store>>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(SWEEP_INTERVAL);
+        store.lock().unwrap().sweep_expired();
+    });
 }
 
 /// Per-connection loop: read raw bytes, feed the resumable RESP parser, dispatch every
