@@ -6,8 +6,23 @@
 
 use crate::resp::Value;
 use crate::store::Store;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+/// Lock the shared store, recovering from mutex poisoning instead of panicking again.
+///
+/// Panics on user input are excluded by design (errors flow back as RESP `-ERR`
+/// replies), so a poisoned mutex would only ever mean a hypothetical bug in a handler
+/// thread. `unwrap()` on the `PoisonError` would then cascade the panic into every
+/// other connection thread — worse than losing just the thread that panicked. Rust
+/// still guarantees the absence of data races after poisoning; only logical
+/// consistency could suffer, and the project's invariants are simple enough that
+/// serving slightly stale data beats a full outage (TECHNICAL_PLAN.md, Этап 5).
+pub fn lock_store(store: &Arc<Mutex<Store>>) -> MutexGuard<'_, Store> {
+    store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Dispatch one decoded client frame (must be a `Value::Array` of `Value::Bulk`) against
 /// the shared store, returning the RESP reply to write back.
@@ -66,7 +81,7 @@ fn cmd_set(store: &Arc<Mutex<Store>>, args: &[Vec<u8>]) -> Value {
         Err(e) => return Value::Error(e),
     };
 
-    store.lock().unwrap().set(key, value, expires_at);
+    lock_store(store).set(key, value, expires_at);
     Value::Simple("OK".into())
 }
 
@@ -116,7 +131,7 @@ fn cmd_expire(store: &Arc<Mutex<Store>>, args: &[Vec<u8>]) -> Value {
     };
     if secs <= 0 {
         // Redis semantics: a non-positive expire deletes the key immediately.
-        let existed = store.lock().unwrap().del(&args[1]);
+        let existed = lock_store(store).del(&args[1]);
         return Value::Integer(if existed { 1 } else { 0 });
     }
     let at = match Instant::now().checked_add(Duration::from_secs(secs as u64)) {
@@ -124,7 +139,7 @@ fn cmd_expire(store: &Arc<Mutex<Store>>, args: &[Vec<u8>]) -> Value {
         // Same overflow guard as SET EX/PX (checked_add over Instant's internal range).
         None => return Value::Error("ERR invalid expire time in 'expire' command".into()),
     };
-    let ok = store.lock().unwrap().expire(&args[1], at);
+    let ok = lock_store(store).expire(&args[1], at);
     Value::Integer(if ok { 1 } else { 0 })
 }
 
@@ -132,14 +147,14 @@ fn cmd_ttl(store: &Arc<Mutex<Store>>, args: &[Vec<u8>]) -> Value {
     if args.len() != 2 {
         return Value::Error("ERR wrong number of arguments for 'ttl' command".into());
     }
-    Value::Integer(store.lock().unwrap().ttl_secs(&args[1]))
+    Value::Integer(lock_store(store).ttl_secs(&args[1]))
 }
 
 fn cmd_get(store: &Arc<Mutex<Store>>, args: &[Vec<u8>]) -> Value {
     if args.len() != 2 {
         return Value::Error("ERR wrong number of arguments for 'get' command".into());
     }
-    match store.lock().unwrap().get(&args[1]) {
+    match lock_store(store).get(&args[1]) {
         Some(v) => Value::Bulk(v),
         None => Value::Null,
     }
@@ -149,7 +164,7 @@ fn cmd_del(store: &Arc<Mutex<Store>>, args: &[Vec<u8>]) -> Value {
     if args.len() < 2 {
         return Value::Error("ERR wrong number of arguments for 'del' command".into());
     }
-    let mut store = store.lock().unwrap();
+    let mut store = lock_store(store);
     let count = args[1..].iter().filter(|k| store.del(k)).count();
     Value::Integer(count as i64)
 }
