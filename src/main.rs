@@ -25,10 +25,22 @@ fn main() -> std::io::Result<()> {
         .nth(1)
         .unwrap_or_else(|| DEFAULT_ADDR.to_string());
 
-    let listener = TcpListener::bind(&addr)?;
-    println!("miniredis listening on {addr}");
+    // Optional LRU capacity via the MINIREDIS_CAPACITY env var (simplest knob, no CLI
+    // flag parser — see docs/TECHNICAL_PLAN.md, Этап 4). Unset or unparsable => unlimited.
+    let capacity: Option<usize> = std::env::var("MINIREDIS_CAPACITY")
+        .ok()
+        .and_then(|s| s.parse().ok());
 
-    let store = Arc::new(Mutex::new(Store::new()));
+    let listener = TcpListener::bind(&addr)?;
+    match capacity {
+        Some(cap) => println!("miniredis listening on {addr} (LRU capacity: {cap})"),
+        None => println!("miniredis listening on {addr} (unlimited capacity)"),
+    }
+
+    let store = Arc::new(Mutex::new(match capacity {
+        Some(cap) => Store::with_capacity(cap),
+        None => Store::new(),
+    }));
     spawn_sweeper(Arc::clone(&store));
 
     for stream in listener.incoming() {
