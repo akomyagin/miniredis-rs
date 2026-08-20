@@ -17,9 +17,12 @@ Guidance for Claude Code when working in the `miniredis-rs` repository.
 
 | Путь | Содержимое |
 |---|---|
-| `src/main.rs` | точка входа: TCP-listener, thread-per-connection, диспатч |
+| `src/lib.rs` | библиотечный корень: модули + `handle_connection`/`spawn_sweeper` (нужен, чтобы `tests/network_e2e.rs` гонял сетевой цикл на настоящих сокетах) |
+| `src/main.rs` | тонкий bin-враппер: парсит адрес/`MINIREDIS_CAPACITY`, TCP-listener, thread-per-connection |
 | `src/resp.rs` | протокольный слой: буферизующий возобновляемый RESP-кодек |
-| `src/store.rs` | слой данных: KV-хранилище, TTL, LRU |
+| `src/command.rs` | командный слой: диспатч разобранных RESP-фреймов на `Store` |
+| `src/store.rs` | слой данных: KV-хранилище, TTL, LRU (slab-арена) |
+| `tests/` | integration-тесты: `concurrency.rs` (без сети), `network_e2e.rs` (настоящие TCP-сокеты) |
 | `docs/` | PLAN, TECHNICAL_PLAN, POST_MVP_PLAN |
 
 ## Ключевые технические решения (зафиксированы)
