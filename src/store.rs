@@ -3,11 +3,11 @@
 //! Built incrementally across stages:
 //!   - Этап 2: plain `HashMap<Vec<u8>, Entry>` behind a `Mutex`, GET/SET/DEL.
 //!   - Этап 3: per-key expiry (`expires_at`), lazy expiration on access + a background
-//!             sweeper thread that reaps expired keys.
+//!     sweeper thread that reaps expired keys.
 //!   - Этап 4: O(1) LRU eviction — an intrusive doubly-linked list threaded through the
-//!             map's entries (or a well-justified crate; decision recorded in
-//!             docs/TECHNICAL_PLAN.md, Этап 4) so both `get` (touch) and `evict`
-//!             (drop the least-recently-used) are O(1), not just insertion.
+//!     map's entries (or a well-justified crate; decision recorded in
+//!     docs/TECHNICAL_PLAN.md, Этап 4) so both `get` (touch) and `evict`
+//!     (drop the least-recently-used) are O(1), not just insertion.
 
 use std::time::Instant;
 
